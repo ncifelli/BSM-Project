@@ -73,7 +73,7 @@ base_win_rate = 0.354
 # --- Dynamic Calculations based on Inputs ---
 # NEW: Linear interpolation for risk factor
 ev_multiplier = np.interp(risk, [0.5, 2.0], [0.7, 1.3]) # EV scales from 70% to 130%
-wr_multiplier = np.interp(risk, [0.5, 2.0], [1.15, 0.85]) # WR scales from 115% to 85%
+wr_multiplier = np.interp(risk, [0.5, 2.0], [1.25, 0.75]) # WR scales from 115% to 85%
 effective_ev = base_ev * ev_multiplier
 effective_win_rate = base_win_rate * wr_multiplier
 reinvestment_decimal = reinvestment_rate / 100.0
