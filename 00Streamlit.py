@@ -6,7 +6,7 @@ from matplotlib.ticker import MaxNLocator
 # --- Page Configuration ---
 st.set_page_config(layout="wide")
 
-st.title("📈 Advanced Betting Strategy Simulator")
+st.title("Portfolio Forecasting")
 st.markdown("""
 This application runs Monte Carlo simulations for two different bankroll management strategies.
 Use the tabs below to switch between a **Static Wager** and a **Compounding Wager** model.
@@ -18,7 +18,7 @@ st.sidebar.header("Simulation Settings")
 
 initial_bankroll = st.sidebar.number_input(
     "Initial Bankroll (Units)",
-    min_value=10.0,
+    min_value=1.0,
     max_value=10000.0,
     value=100.0,
     step=10.0,
@@ -34,12 +34,12 @@ bets_per_day = st.sidebar.number_input(
 )
 
 risk = st.sidebar.slider(
-    "Risk Multiplier (Higher risk = higher variance)",
+    "Risk Multiplier",
     min_value=0.5,
     max_value=2.0,
     value=1.0,
     step=0.01,
-    help="Adjust the overall risk factor. This scales the base Expected Value (EV) and Win Rate of all bets."
+    help="Adjusts the risk-reward profile. Higher risk linearly increases EV and decreases Win Rate."
 )
 
 st.sidebar.header("Wager Settings")
@@ -71,8 +71,11 @@ base_ev = 0.12
 base_win_rate = 0.354
 
 # --- Dynamic Calculations based on Inputs ---
-effective_ev = base_ev * np.sqrt(risk)
-effective_win_rate = base_win_rate * (1/risk)
+# NEW: Linear interpolation for risk factor
+ev_multiplier = np.interp(risk, [0.5, 2.0], [0.7, 1.3]) # EV scales from 70% to 130%
+wr_multiplier = np.interp(risk, [0.5, 2.0], [1.15, 0.85]) # WR scales from 115% to 85%
+effective_ev = base_ev * ev_multiplier
+effective_win_rate = base_win_rate * wr_multiplier
 reinvestment_decimal = reinvestment_rate / 100.0
 
 # --- Staking Plan Logic (Relative Weights) ---
@@ -91,7 +94,7 @@ tier_definitions_template = [
     {'count': tier3_count, 'ev_mod': 0.9, 'wr_mod': 0.95}
 ]
 
-# Pre-calculate tier parameters that don't change
+# Pre-calculate tier parameters
 for tier in tier_definitions_template:
     if tier['count'] > 0:
         tier['wr'] = np.clip(effective_win_rate * tier['wr_mod'], 0.01, 0.99)
@@ -103,77 +106,56 @@ for tier in tier_definitions_template:
 
 # --- Simulation Functions ---
 
-@st.cache_data
-def run_static_simulation(sims, days, bets, daily_stakes):
+def run_simulation_with_bankruptcy(sims, days, start_bankroll, daily_wager_func):
     """
-    Runs the simulation with a fixed total wager each day. Fully vectorized.
-    """
-    total_daily_profit = np.zeros((sims, days))
-    current_stake_idx = 0
-    
-    for tier in tier_definitions_template:
-        if tier['count'] == 0:
-            continue
-
-        outcomes = np.random.choice(
-            [tier['odds'] - 1, -1],
-            size=(sims, days * tier['count']),
-            p=[tier['wr'], 1 - tier['wr']]
-        ).reshape(sims, days, tier['count'])
-        
-        end_stake_idx = current_stake_idx + tier['count']
-        tier_stakes = daily_stakes[current_stake_idx:end_stake_idx]
-        current_stake_idx = end_stake_idx
-
-        profit_loss_by_bet = outcomes * tier_stakes
-        total_daily_profit += profit_loss_by_bet.sum(axis=2)
-        
-    return np.cumsum(total_daily_profit, axis=1)
-
-@st.cache_data
-def run_compounding_simulation(sims, days, bets, rel_weights, start_bankroll, reinvest_rate):
-    """
-    Runs the simulation where the daily wager is 10 units + a percentage of profits.
+    Generic simulation function that loops day-by-day to handle bankruptcy.
     """
     bankrolls = np.full(sims, start_bankroll)
     cumulative_profit_history = np.zeros((sims, days))
+    is_active = np.full(sims, True)
+    bankrupt_sims = np.full(sims, False)
 
     for day in range(days):
-        profit = bankrolls - start_bankroll
-        # Wager is 10 + reinvestment rate * profit (but only if profit is positive)
-        daily_total_wagers = 10.0 + (reinvest_rate * np.maximum(0, profit))
-        
-        daily_stakes_matrix = daily_total_wagers[:, np.newaxis] * rel_weights
-        total_profit_for_day = np.zeros(sims)
+        active_indices = np.where(is_active)[0]
+        if len(active_indices) == 0: # Stop if all have gone bankrupt
+            cumulative_profit_history[:, day:] = cumulative_profit_history[:, day-1, np.newaxis]
+            break
+
+        daily_total_wagers = daily_wager_func(bankrolls[active_indices], start_bankroll)
+        daily_stakes_matrix = daily_total_wagers[:, np.newaxis] * normalized_weights
+        total_profit_for_day = np.zeros(len(active_indices))
         
         current_stake_idx = 0
         for tier in tier_definitions_template:
-            if tier['count'] == 0:
-                continue
-            
-            outcomes = np.random.choice(
-                [tier['odds'] - 1, -1],
-                size=(sims, tier['count']),
-                p=[tier['wr'], 1 - tier['wr']]
-            )
-            
-            end_stake_idx = current_stake_idx + tier['count']
-            tier_stakes = daily_stakes_matrix[:, current_stake_idx:end_stake_idx]
-            current_stake_idx = end_stake_idx
+            if tier['count'] > 0:
+                outcomes = np.random.choice(
+                    [tier['odds'] - 1, -1],
+                    size=(len(active_indices), tier['count']),
+                    p=[tier['wr'], 1 - tier['wr']]
+                )
+                end_stake_idx = current_stake_idx + tier['count']
+                tier_stakes = daily_stakes_matrix[:, current_stake_idx:end_stake_idx]
+                current_stake_idx = end_stake_idx
+                total_profit_for_day += (outcomes * tier_stakes).sum(axis=1)
 
-            total_profit_for_day += (outcomes * tier_stakes).sum(axis=1)
-
-        bankrolls += total_profit_for_day
+        bankrolls[active_indices] += total_profit_for_day
+        
+        # Update bankruptcy status
+        newly_bankrupt = bankrolls < 0
+        bankrupt_sims = np.logical_or(bankrupt_sims, newly_bankrupt)
+        is_active = bankrolls > 0
+        
         cumulative_profit_history[:, day] = bankrolls - start_bankroll
 
-    return cumulative_profit_history
+    bankruptcy_rate = np.mean(bankrupt_sims)
+    return cumulative_profit_history, bankruptcy_rate
 
 # --- Helper Function for Displaying Results ---
-def display_results(cumulative_profit, stakes_for_histogram, total_wager_for_histogram):
-    """
-    Takes simulation results and displays the graph, metrics, and histogram.
-    """
-    # --- Data Processing for Plotting ---
+def display_results(cumulative_profit, bankruptcy_rate, stakes_for_histogram, total_wager_for_histogram):
+    st.subheader("Simulation Results")
+    fig, ax = plt.subplots(figsize=(12, 7))
+    days_axis = np.arange(1, num_days + 1)
+
     median_line = np.percentile(cumulative_profit, 50, axis=0)
     ci_60_upper = np.percentile(cumulative_profit, 80, axis=0)
     ci_60_lower = np.percentile(cumulative_profit, 20, axis=0)
@@ -182,49 +164,35 @@ def display_results(cumulative_profit, stakes_for_histogram, total_wager_for_his
     ci_95_upper = np.percentile(cumulative_profit, 97.5, axis=0)
     ci_95_lower = np.percentile(cumulative_profit, 2.5, axis=0)
 
-    # --- Plotting ---
-    st.subheader("Simulation Results")
-    fig, ax = plt.subplots(figsize=(12, 7))
-    days_axis = np.arange(1, num_days + 1)
-
-    # Plot confidence intervals
     ax.fill_between(days_axis, ci_95_lower, ci_95_upper, color='#e0e0e0', alpha=0.9, label='95% Range of Outcomes')
     ax.fill_between(days_axis, ci_80_lower, ci_80_upper, color='#bdbdbd', alpha=0.8, label='80% Range of Outcomes')
     ax.fill_between(days_axis, ci_60_lower, ci_60_upper, color='#9e9e9e', alpha=0.7, label='60% Range of Outcomes')
-
     ax.plot(days_axis, median_line, color='#d32f2f', linestyle='--', linewidth=2, label='Median Outcome')
     ax.axhline(0, color='black', linestyle='-', linewidth=1)
-
     ax.set_title(f'Future Profit/Loss Distribution ({num_simulations:,} simulations)', fontsize=16)
     ax.set_xlabel('Days', fontsize=12)
-    ax.set_ylabel(f'Cumulative Profit/Loss (Units)', fontsize=12)
+    ax.set_ylabel('Cumulative Profit/Loss (Units)', fontsize=12)
     ax.legend()
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
     ax.set_xlim(0, num_days)
     ax.set_ylim(np.min(ci_95_lower) * 1.1, np.max(ci_95_upper) * 1.1)
     st.pyplot(fig)
 
-    # --- Display Key Metrics ---
     st.subheader("Key Outcome Metrics at Day 90")
-    col1, col2, col3, col4 = st.columns(4)
+    cols = st.columns(5)
     final_day_outcomes = cumulative_profit[:, -1]
     
-    prob_profit = np.mean(final_day_outcomes > 0)
-    avg_outcome = np.mean(final_day_outcomes)
+    cols[0].metric("Median Outcome", f"{median_line[-1]:.2f} units")
+    cols[1].metric("Average Outcome", f"{np.mean(final_day_outcomes):.2f} units")
+    cols[2].metric("Probability of Profit", f"{np.mean(final_day_outcomes > 0):.1%}")
+    cols[3].metric("5th Percentile", f"{ci_95_lower[-1]:.2f} units")
+    cols[4].metric("Bankruptcy Rate", f"{bankruptcy_rate:.1%}", help="Percentage of simulations where the bankroll dropped to 0 or below.")
 
-    col1.metric("Median Outcome", f"{median_line[-1]:.2f} units")
-    col2.metric("Average Outcome", f"{avg_outcome:.2f} units")
-    col3.metric("Probability of Profit", f"{prob_profit:.1%}")
-    col4.metric("10th Percentile Outcome", f"{ci_80_lower[-1]:.2f} units")
-
-    # --- Histogram of Stakes ---
     st.subheader("Example Daily Staking Distribution")
     stakes_percentage = (stakes_for_histogram / total_wager_for_histogram) * 100
-    
     fig_hist, ax_hist = plt.subplots(figsize=(12, 5))
     ax_hist.hist(stakes_percentage, bins='auto', color='#42a5f5', edgecolor='black')
-
-    ax_hist.set_title(f'Distribution of Bet Stakes (% of Daily Total)', fontsize=16)
+    ax_hist.set_title('Distribution of Bet Stakes (% of Daily Total)', fontsize=16)
     ax_hist.set_xlabel('% of Daily Units Staked per Bet', fontsize=12)
     ax_hist.set_ylabel('Number of Bets (Frequency)', fontsize=12)
     ax_hist.grid(axis='y', linestyle='--', linewidth=0.5)
@@ -237,26 +205,20 @@ tab1, tab2 = st.tabs(["Static Wager Simulation", "Compounding Wager Simulation"]
 
 with tab1:
     st.header("📈 Static Wager Model")
-    st.write(f"This model simulates a strategy where you wager a fixed total of **{static_total_units_per_day} units** every day, distributed across your bets.")
+    st.write(f"This model simulates wagering a fixed total of **{static_total_units_per_day} units** every day.")
     
-    # Calculate stakes for the static model
+    static_wager_func = lambda br, sb: np.full(br.shape, static_total_units_per_day)
+    static_results, static_br_rate = run_simulation_with_bankruptcy(num_simulations, num_days, initial_bankroll, static_wager_func)
+    
     static_stakes = normalized_weights * static_total_units_per_day
-    
-    # Run simulation
-    static_results = run_static_simulation(num_simulations, num_days, bets_per_day, static_stakes)
-    
-    # Display results
-    display_results(static_results, static_stakes, static_total_units_per_day)
+    display_results(static_results, static_br_rate, static_stakes, static_total_units_per_day)
 
 with tab2:
     st.header("🚀 Compounding Wager Model")
-    st.write(f"This model simulates a dynamic strategy. Each day, you wager **10 units + {reinvestment_rate:.0f}%** of any profit you have accumulated.")
+    st.write(f"This model wagers **10 units + {reinvestment_rate:.0f}%** of any accumulated profit each day.")
 
-    # Run simulation
-    compounding_results = run_compounding_simulation(num_simulations, num_days, bets_per_day, normalized_weights, initial_bankroll, reinvestment_decimal)
+    compounding_wager_func = lambda br, sb: 10.0 + (reinvestment_decimal * np.maximum(0, br - sb))
+    compounding_results, compounding_br_rate = run_simulation_with_bankruptcy(num_simulations, num_days, initial_bankroll, compounding_wager_func)
     
-    # For the histogram, we show the initial day's wager distribution
-    day1_stakes = normalized_weights * 10.0 # On day 1, profit is 0, so wager is 10
-    
-    # Display results
-    display_results(compounding_results, day1_stakes, 10.0)
+    day1_stakes = normalized_weights * 10.0
+    display_results(compounding_results, compounding_br_rate, day1_stakes, 10.0)
