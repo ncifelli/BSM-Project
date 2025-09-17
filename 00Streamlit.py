@@ -30,7 +30,7 @@ bets_per_day = st.sidebar.number_input(
     min_value=1,
     max_value=100,
     value=25,
-    help="Set the total number of bets you plan to place each day (1-100)."
+    help="Set the total number of bets you plan to place each day (1-100). These are chosen randomly from a pool of 1000."
 )
 
 risk = st.sidebar.slider(
@@ -71,7 +71,6 @@ base_ev = 0.12
 base_win_rate = 0.354
 
 # --- Dynamic Calculations based on Inputs ---
-# NEW: Linear interpolation for risk factor
 ev_multiplier = np.interp(risk, [0.5, 2.0], [0.7, 1.3]) # EV scales from 70% to 130%
 wr_multiplier = np.interp(risk, [0.5, 2.0], [1.25, 0.75]) # WR scales from 115% to 85%
 effective_ev = base_ev * ev_multiplier
@@ -83,30 +82,41 @@ bet_indices = np.arange(1, bets_per_day + 1)
 bet_weights = 1 / np.sqrt(bet_indices)
 normalized_weights = bet_weights / np.sum(bet_weights)
 
-# --- Tier Definitions (shared by both simulations) ---
-tier1_count = min(bets_per_day, 5)
-tier2_count = min(bets_per_day - tier1_count, 15)
-tier3_count = max(0, bets_per_day - 20)
-
-tier_definitions_template = [
-    {'count': tier1_count, 'ev_mod': 1.2, 'wr_mod': 1.1},
-    {'count': tier2_count, 'ev_mod': 1.0, 'wr_mod': 1.0},
-    {'count': tier3_count, 'ev_mod': 0.9, 'wr_mod': 0.95}
+# --- Bet Pool Definition ---
+bet_pool_definition = [
+    {'count': 50, 'ev_mod': 1.2, 'wr_mod': 1.2},
+    {'count': 50, 'ev_mod': 1.1, 'wr_mod': 1.1},
+    {'count': 100, 'ev_mod': 1.05, 'wr_mod': 1.05},
+    {'count': 300, 'ev_mod': 1.0, 'wr_mod': 1.0},
+    {'count': 300, 'ev_mod': 0.95, 'wr_mod': 0.95},
+    {'count': 100, 'ev_mod': 0.9, 'wr_mod': 0.9},
+    {'count': 100, 'ev_mod': 0.8, 'wr_mod': 0.8}
 ]
 
-# Pre-calculate tier parameters
-for tier in tier_definitions_template:
-    if tier['count'] > 0:
-        tier['wr'] = np.clip(effective_win_rate * tier['wr_mod'], 0.01, 0.99)
-        tier_ev = effective_ev * tier['ev_mod']
-        if (tier_ev + 1) / tier['wr'] < 1:
-             st.error("Invalid settings. A tier's calculated odds are less than 1.", icon="🚨")
-             st.stop()
-        tier['odds'] = (tier_ev + 1) / tier['wr']
+# Create the full pool of 1000 bets
+bet_pool = []
+for bet_type in bet_pool_definition:
+    for _ in range(bet_type['count']):
+        bet_pool.append({'ev_mod': bet_type['ev_mod'], 'wr_mod': bet_type['wr_mod']})
+
+# Pre-calculate derived parameters for the entire pool
+for bet in bet_pool:
+    bet['wr'] = np.clip(effective_win_rate * bet['wr_mod'], 0.01, 0.99)
+    bet_ev = effective_ev * bet['ev_mod']
+    calculated_odds = (bet_ev + 1) / bet['wr']
+    if calculated_odds < 1:
+        st.error(f"Invalid settings. A bet type calculates odds less than 1 ({calculated_odds:.2f}). Try adjusting risk or base assumptions.", icon="🚨")
+        st.stop()
+    bet['odds'] = calculated_odds
+
+# For vectorized calculations, create numpy arrays from the pool
+pool_wrs = np.array([bet['wr'] for bet in bet_pool])
+pool_odds = np.array([bet['odds'] for bet in bet_pool])
+
 
 # --- Simulation Functions ---
 
-def run_simulation_with_bankruptcy(sims, days, start_bankroll, daily_wager_func):
+def run_simulation_with_bankruptcy(sims, days, start_bankroll, daily_wager_func, p_wrs, p_odds):
     """
     Generic simulation function that loops day-by-day to handle bankruptcy.
     """
@@ -123,20 +133,29 @@ def run_simulation_with_bankruptcy(sims, days, start_bankroll, daily_wager_func)
 
         daily_total_wagers = daily_wager_func(bankrolls[active_indices], start_bankroll)
         daily_stakes_matrix = daily_total_wagers[:, np.newaxis] * normalized_weights
-        total_profit_for_day = np.zeros(len(active_indices))
         
-        current_stake_idx = 0
-        for tier in tier_definitions_template:
-            if tier['count'] > 0:
-                outcomes = np.random.choice(
-                    [tier['odds'] - 1, -1],
-                    size=(len(active_indices), tier['count']),
-                    p=[tier['wr'], 1 - tier['wr']]
-                )
-                end_stake_idx = current_stake_idx + tier['count']
-                tier_stakes = daily_stakes_matrix[:, current_stake_idx:end_stake_idx]
-                current_stake_idx = end_stake_idx
-                total_profit_for_day += (outcomes * tier_stakes).sum(axis=1)
+        num_active_sims = len(active_indices)
+        
+        # Randomly select 'bets_per_day' bets from the pool for each active simulation
+        bet_indices_for_day = np.random.randint(0, len(bet_pool), size=(num_active_sims, bets_per_day))
+        
+        # Get the corresponding win rates and odds for the selected bets
+        sampled_wrs = p_wrs[bet_indices_for_day]
+        sampled_odds = p_odds[bet_indices_for_day]
+        
+        # Simulate outcomes for all bets across all simulations
+        random_outcomes = np.random.rand(num_active_sims, bets_per_day)
+        is_win = random_outcomes < sampled_wrs
+        
+        # Calculate profit/loss for each bet
+        profit_matrix = np.where(
+            is_win,
+            daily_stakes_matrix * (sampled_odds - 1),
+            -daily_stakes_matrix
+        )
+        
+        # Sum the profits for the day for each simulation
+        total_profit_for_day = profit_matrix.sum(axis=1)
 
         bankrolls[active_indices] += total_profit_for_day
         
@@ -208,7 +227,7 @@ with tab1:
     st.write(f"This model simulates wagering a fixed total of **{static_total_units_per_day} units** every day.")
     
     static_wager_func = lambda br, sb: np.full(br.shape, static_total_units_per_day)
-    static_results, static_br_rate = run_simulation_with_bankruptcy(num_simulations, num_days, initial_bankroll, static_wager_func)
+    static_results, static_br_rate = run_simulation_with_bankruptcy(num_simulations, num_days, initial_bankroll, static_wager_func, pool_wrs, pool_odds)
     
     static_stakes = normalized_weights * static_total_units_per_day
     display_results(static_results, static_br_rate, static_stakes, static_total_units_per_day)
@@ -218,7 +237,7 @@ with tab2:
     st.write(f"This model wagers **10 units + {reinvestment_rate:.0f}%** of any accumulated profit each day.")
 
     compounding_wager_func = lambda br, sb: 10.0 + (reinvestment_decimal * np.maximum(0, br - sb))
-    compounding_results, compounding_br_rate = run_simulation_with_bankruptcy(num_simulations, num_days, initial_bankroll, compounding_wager_func)
+    compounding_results, compounding_br_rate = run_simulation_with_bankruptcy(num_simulations, num_days, initial_bankroll, compounding_wager_func, pool_wrs, pool_odds)
     
     day1_stakes = normalized_weights * 10.0
     display_results(compounding_results, compounding_br_rate, day1_stakes, 10.0)
