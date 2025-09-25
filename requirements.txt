@@ -2,3 +2,8 @@ streamlit
 numpy
 scipy
 matplotlib
+pandas
+altair
+supabase
+python-dotenv
+streamlit-autorefresh
